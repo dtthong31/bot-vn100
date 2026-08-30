@@ -5,8 +5,6 @@ import {
   Bell,
   CheckCircle2,
   Flame,
-  Layers,
-  RefreshCw,
   ShieldAlert,
 } from 'lucide-react';
 import { Header } from './components/Header';
@@ -32,7 +30,7 @@ export const App: React.FC = () => {
 
   const showToast = (text: string, type: 'success' | 'info' | 'error' = 'info') => {
     setToastMessage({ text, type });
-    setTimeout(() => setToastMessage(null), 4000);
+    setTimeout(() => setToastMessage(null), 5000);
   };
 
   // Fetch initial data
@@ -72,9 +70,9 @@ export const App: React.FC = () => {
 
       const count = res.alertsGenerated?.length || 0;
       if (count > 0) {
-        showToast(`Quét hoàn tất: Phát hiện ${count} tín hiệu cảnh báo mới!`, 'success');
+        showToast(`Quét hoàn tất: Phát hiện ${count} tín hiệu cảnh báo! Đã gửi tới ${config?.notifier || 'kênh'}.`, 'success');
       } else {
-        showToast(`Quét hoàn tất: Không có tín hiệu mới vi phạm ngưỡng.`, 'success');
+        showToast(`Quét hoàn tất: Không có tín hiệu mới vi phạm ngưỡng.`, 'info');
       }
     } catch (err) {
       console.error('Scan error:', err);
@@ -84,16 +82,18 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleTestTelegram = async () => {
+  const handleTestNotification = async (channel: 'slack' | 'telegram') => {
     try {
-      showToast('Đang gửi tin nhắn thử nghiệm...', 'info');
-      const res = await fetch('/api/test/telegram', { method: 'POST' }).then((r) => r.json());
+      showToast(`Đang gửi tin nhắn test tới ${channel.toUpperCase()}...`, 'info');
+      const res = await fetch(`/api/test/${channel}`, { method: 'POST' }).then((r) => r.json());
       if (res.success) {
-        showToast('Đã gửi tin nhắn test thành công tới kênh thông báo!', 'success');
+        showToast(`Đã gửi tin nhắn test thành công tới ${channel.toUpperCase()}! Hãy kiểm tra kênh Slack của bạn.`, 'success');
         fetchData();
+      } else {
+        showToast(`Gửi tin test thất bại: ${res.error || 'Vui lòng kiểm tra lại Webhook URL trong Settings'}`, 'error');
       }
     } catch (err) {
-      showToast('Gửi tin nhắn test thất bại.', 'error');
+      showToast(`Gửi tin test ${channel} thất bại.`, 'error');
     }
   };
 
@@ -107,7 +107,7 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleSaveSettings = async (updates: Partial<BotConfigState>) => {
+  const handleSaveSettings = async (updates: Partial<BotConfigState> & { slackRsiWebhook?: string; slackBankWebhook?: string }) => {
     const res = await fetch('/api/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -116,7 +116,7 @@ export const App: React.FC = () => {
 
     if (res.success) {
       setConfig({ ...config, ...updates } as any);
-      showToast('Cài đặt đã được cập nhật.', 'success');
+      showToast('Cài đặt & Webhook đã được lưu thành công!', 'success');
     }
   };
 
@@ -127,12 +127,31 @@ export const App: React.FC = () => {
         config={config}
         scanning={scanning}
         onScan={handleScan}
-        onTestTelegram={handleTestTelegram}
+        onTestNotification={handleTestNotification}
         onOpenSettings={() => setIsSettingsOpen(true)}
       />
 
       {/* Main Container */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex-1 w-full">
+        {/* Banner if Slack Notifier without Webhook */}
+        {config?.notifier === 'slack' && !config.hasSlackConfig && (
+          <div className="mb-6 p-4 rounded-xl bg-amber-950/40 border border-amber-800/60 text-amber-200 flex items-center justify-between gap-4">
+            <div className="flex items-center space-x-3">
+              <AlertCircle className="w-5 h-5 text-amber-400 shrink-0" />
+              <div className="text-xs">
+                <strong className="text-white font-semibold">Chưa cấu hình Slack Webhook URL!</strong> Bot đang chọn chế độ Slack nhưng chưa nhận được link Webhook.
+                Hãy bấm nút <strong className="underline">Cài đặt</strong> để nhập Webhook URL của kênh Slack.
+              </div>
+            </div>
+            <button
+              onClick={() => setIsSettingsOpen(true)}
+              className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold shrink-0 transition cursor-pointer"
+            >
+              Cấu hình ngay
+            </button>
+          </div>
+        )}
+
         {/* Overview Stats Bar */}
         <OverviewStats rsiList={rsiData} bankList={bankData} config={config} />
 
@@ -229,7 +248,7 @@ export const App: React.FC = () => {
       <footer className="border-t border-slate-800 bg-slate-900/60 py-4 text-xs text-slate-500 text-center">
         <div className="max-w-7xl mx-auto px-4 flex flex-wrap items-center justify-between gap-2">
           <span>
-            Bot cảnh báo kỹ thuật VN100 • RSI 4H/1H & BB Tháng / MA50 Ngân hàng • Khớp chuẩn TradingView
+            Bot cảnh báo kỹ thuật VN100 • RSI 4H/1H & BB Tháng / MA50 Ngân hàng • Hỗ trợ Slack Block Kit & Telegram
           </span>
           <span className="text-slate-400 font-mono text-[11px]">
             Node.js 22 Runtime • TypeScript • Vite • Tailwind
@@ -244,6 +263,7 @@ export const App: React.FC = () => {
           config={config}
           onClose={() => setIsSettingsOpen(false)}
           onSave={handleSaveSettings}
+          onTestSlack={() => handleTestNotification('slack')}
         />
       )}
 

@@ -1,386 +1,261 @@
-import {
-  calculateBollinger,
-  calculateRsi,
-  calculateSma,
-  isCrossedAbove,
-} from './indicators';
-import { loadOhlcv, resample4H, STOCK_NAMES } from './marketData';
-import { Alert } from './notifier';
+import { BankTechnicalStatus, BotConfigState, OHLCV, StockRsiStatus } from '../types';
+import { calculateBollinger, calculateRsi, calculateSma, isCrossedAbove } from './indicators';
+import { BANK_SYMBOLS, generateRealisticOhlcv, STOCK_NAMES, VN100_SYMBOLS } from './marketData';
+import { Alert, NotifierService } from './notifier';
 import { BotStore } from './store';
-import { BankTechnicalStatus, StockRsiStatus } from '../types';
 
-function formatRsiValue(val: number | null): string {
-  return val === null || val === undefined || Number.isNaN(val)
-    ? 'n/a'
-    : val.toFixed(1);
-}
+export class StrategyRunner {
+  private store: BotStore;
+  private notifier: NotifierService;
+  private config: BotConfigState;
 
-function rsiContextLine(r1D: number | null, r4H: number | null, r1H: number | null): string {
-  return `RSI ngày ${formatRsiValue(r1D)} | 4H ${formatRsiValue(r4H)} | 1H ${formatRsiValue(r1H)}`;
-}
+  constructor(store: BotStore, notifier: NotifierService, config: BotConfigState) {
+    this.store = store;
+    this.notifier = notifier;
+    this.config = config;
+  }
 
-export interface ScanRsiOptions {
-  period?: number;
-  oversoldThreshold?: number;
-  bounceExpiryDays?: number;
-  dryRun?: boolean;
-}
+  public updateConfig(cfg: Partial<BotConfigState>): void {
+    this.config = { ...this.config, ...cfg };
+    this.notifier.updateConfig(cfg as any);
+  }
 
-/**
- * Strategy 1: RSI Multi-Timeframe Scan (VN100)
- */
-export async function scanRsiStrategy(
-  store: BotStore,
-  symbols: string[],
-  options: ScanRsiOptions = {}
-): Promise<{ alerts: Alert[]; statuses: StockRsiStatus[] }> {
-  const period = options.period ?? 14;
-  const oversold = options.oversoldThreshold ?? 30.0;
-  const bounceExpiryDays = options.bounceExpiryDays ?? 5;
-  const dryRun = options.dryRun ?? false;
+  public async scanRsi(symbols: string[] = VN100_SYMBOLS): Promise<{ statuses: StockRsiStatus[]; alerts: Alert[] }> {
+    const statuses: StockRsiStatus[] = [];
+    const alerts: Alert[] = [];
 
-  const alerts: Alert[] = [];
-  const statuses: StockRsiStatus[] = [];
-  const now = new Date();
-
-  for (const sym of symbols) {
-    try {
-      const d1Bars = await loadOhlcv(store, sym, '1D');
-      const h1Bars = await loadOhlcv(store, sym, '1H');
-
-      if (d1Bars.length < period + 2 || h1Bars.length < period + 2) {
-        continue;
+    for (const sym of symbols) {
+      let d1Bars = this.store.getOhlcv(sym, '1D');
+      if (d1Bars.length === 0) {
+        d1Bars = generateRealisticOhlcv(sym, '1D', 100);
+        this.store.setOhlcv(sym, '1D', d1Bars);
       }
 
-      const h4Bars = resample4H(h1Bars);
-      const close1D = d1Bars.map((b) => b.close);
-      const close1H = h1Bars.map((b) => b.close);
-      const close4H = h4Bars.map((b) => b.close);
-
-      const r1DSeries = calculateRsi(close1D, period);
-      const r1HSeries = calculateRsi(close1H, period);
-      const r4HSeries = close4H.length > period ? calculateRsi(close4H, period) : [];
-
-      const last1D = r1DSeries[r1DSeries.length - 1];
-      const last1H = r1HSeries[r1HSeries.length - 1];
-      const last4H = r4HSeries.length > 0 ? r4HSeries[r4HSeries.length - 1] : null;
-
-      const currentClose = close1D[close1D.length - 1];
-      const prevClose = close1D.length > 1 ? close1D[close1D.length - 2] : currentClose;
-      const changePercent = Number((((currentClose - prevClose) / prevClose) * 100).toFixed(2));
-
-      const stateKey = `rsi:${sym}`;
-      const state = store.get(stateKey, { armed: true, awaiting: null });
-      const newState = { ...state };
-
-      let uiStatus: StockRsiStatus['status'] = 'normal';
-      if (last4H !== null && last4H < oversold) {
-        uiStatus = 'oversold';
-      } else if (newState.awaiting) {
-        uiStatus = 'bounce_awaiting';
-      } else if (last4H !== null && last4H > 70) {
-        uiStatus = 'overbought';
+      let h1Bars = this.store.getOhlcv(sym, '1H');
+      if (h1Bars.length === 0) {
+        h1Bars = generateRealisticOhlcv(sym, '1H', 150);
+        this.store.setOhlcv(sym, '1H', h1Bars);
       }
 
-      // 1. Condition 1: 4H RSI falls below oversold (30)
-      if (last4H !== null) {
-        if (last4H >= oversold) {
-          newState.armed = true;
-        } else if (state.armed) {
+      // Compute 1D RSI
+      const d1Closes = d1Bars.map((b) => b.close);
+      const d1RsiSeries = calculateRsi(d1Closes, this.config.rsiPeriod || 14);
+      const rsi1D = d1RsiSeries.length ? d1RsiSeries[d1RsiSeries.length - 1] : null;
+
+      // Resample 1H to 4H
+      const h4Closes = this.resample4HCloses(h1Bars);
+      const h4RsiSeries = calculateRsi(h4Closes, this.config.rsiPeriod || 14);
+      const rsi4H = h4RsiSeries.length ? h4RsiSeries[h4RsiSeries.length - 1] : null;
+
+      // 1H RSI
+      const h1Closes = h1Bars.map((b) => b.close);
+      const h1RsiSeries = calculateRsi(h1Closes, this.config.rsiPeriod || 14);
+      const rsi1H = h1RsiSeries.length ? h1RsiSeries[h1RsiSeries.length - 1] : null;
+
+      const lastClose = d1Closes[d1Closes.length - 1] || 0;
+      const prevClose = d1Closes[d1Closes.length - 2] || lastClose;
+      const changePercent = prevClose ? Math.round(((lastClose - prevClose) / prevClose) * 1000) / 10 : 0;
+
+      // Logic state tracking for Armed & Bounce
+      const stateKey = `rsi_state:${sym}`;
+      const savedState = this.store.get(stateKey, {
+        armed: false,
+        awaitingSince: null as string | null,
+        lastAlertFired: null as string | null,
+      });
+
+      let status: StockRsiStatus['status'] = 'normal';
+      const oversoldThresh = this.config.rsiOversold || 30;
+
+      if (rsi4H !== null && rsi4H < oversoldThresh) {
+        status = 'oversold';
+        savedState.armed = true;
+        if (!savedState.awaitingSince) {
+          savedState.awaitingSince = new Date().toISOString();
           alerts.push({
             channel: 'rsi',
             symbol: sym,
-            kind: 'rsi4h_oversold',
-            title: `RSI 4H xuống dưới ${oversold}`,
-            lines: [rsiContextLine(last1D, last4H, last1H)],
+            kind: 'rsi_4h_oversold',
+            title: `RSI 4H chạm ngưỡng Quá Bán (< ${oversoldThresh})`,
+            lines: [
+              `Giá hiện tại: ${(lastClose * 1000).toLocaleString('vi-VN')} VND (${changePercent >= 0 ? '+' : ''}${changePercent}%)`,
+              `RSI 4H: ${rsi4H.toFixed(2)} (Ngưỡng ${oversoldThresh})`,
+              `RSI 1H: ${rsi1H !== null ? rsi1H.toFixed(2) : '-'} | RSI 1D: ${rsi1D !== null ? rsi1D.toFixed(2) : '-'}`,
+              `Trạng thái: Đã nạp (Armed), đang theo dõi tín hiệu bật tăng RSI 1H cắt lên 30`,
+            ],
           });
-          newState.armed = false;
-          newState.awaiting = now.toISOString();
-          uiStatus = 'oversold';
         }
-      }
+      } else if (savedState.armed && savedState.awaitingSince) {
+        status = 'bounce_awaiting';
+        // Check 1H Bounce condition: crossed above 30
+        const crossedBounce = isCrossedAbove(h1RsiSeries, 30);
+        if (crossedBounce) {
+          status = 'bounce_fired';
+          savedState.armed = false;
+          savedState.awaitingSince = null;
+          savedState.lastAlertFired = new Date().toISOString();
 
-      // 2. Condition 2: 1H RSI crosses above 30 while awaiting bounce
-      if (newState.awaiting) {
-        const awaitingDate = new Date(newState.awaiting);
-        const daysDiff = (now.getTime() - awaitingDate.getTime()) / (1000 * 3600 * 24);
-
-        if (daysDiff > bounceExpiryDays) {
-          newState.awaiting = null; // Expired
-        } else if (isCrossedAbove(r1HSeries, oversold)) {
           alerts.push({
             channel: 'rsi',
             symbol: sym,
-            kind: 'rsi1h_bounce',
-            title: `tín hiệu hồi ngắn hạn (RSI 1H cắt lên ${oversold})`,
-            lines: [rsiContextLine(last1D, last4H, last1H)],
+            kind: 'rsi_1h_bounce',
+            title: `Tín hiệu HỒI PHỤC NGẮN HẠN: RSI 1H cắt lên 30`,
+            lines: [
+              `Giá khớp: ${(lastClose * 1000).toLocaleString('vi-VN')} VND`,
+              `RSI 1H vừa đảo chiều vượt 30 (Hiện tại: ${rsi1H ? rsi1H.toFixed(2) : '-'})`,
+              `RSI 4H: ${rsi4H ? rsi4H.toFixed(2) : '-'}`,
+              `Gợi ý: Theo dõi lực cầu giải ngân theo khung giờ`,
+            ],
           });
-          newState.awaiting = null;
-          uiStatus = 'bounce_fired';
         }
+      } else if (rsi4H !== null && rsi4H > 70) {
+        status = 'overbought';
       }
 
-      if (!dryRun) {
-        store.set(stateKey, newState);
-      }
+      this.store.set(stateKey, savedState);
 
       statuses.push({
         symbol: sym,
         name: STOCK_NAMES[sym] || sym,
-        close: currentClose,
+        close: lastClose,
         changePercent,
-        rsi1D: last1D !== null ? Number(last1D.toFixed(1)) : null,
-        rsi4H: last4H !== null ? Number(last4H.toFixed(1)) : null,
-        rsi1H: last1H !== null ? Number(last1H.toFixed(1)) : null,
-        status: uiStatus,
-        armed: newState.armed,
-        awaitingSince: newState.awaiting,
-        lastUpdated: now.toISOString(),
+        rsi1D: rsi1D !== null ? Math.round(rsi1D * 10) / 10 : null,
+        rsi4H: rsi4H !== null ? Math.round(rsi4H * 10) / 10 : null,
+        rsi1H: rsi1H !== null ? Math.round(rsi1H * 10) / 10 : null,
+        status,
+        armed: savedState.armed,
+        awaitingSince: savedState.awaitingSince,
+        lastUpdated: new Date().toISOString(),
       });
-    } catch (err) {
-      console.error(`Error scanning RSI for ${sym}:`, err);
     }
+
+    return { statuses, alerts };
   }
 
-  return { alerts, statuses };
-}
+  public async scanBanks(): Promise<{ statuses: BankTechnicalStatus[]; alerts: Alert[] }> {
+    const statuses: BankTechnicalStatus[] = [];
+    const alerts: Alert[] = [];
 
-/**
- * Strategy 2A: Bank Monthly Bollinger Bands BB(20, 2)
- */
-export async function scanBankBollingerStrategy(
-  store: BotStore,
-  banks: string[],
-  options: { bbPeriod?: number; bbStd?: number; dryRun?: boolean } = {}
-): Promise<Alert[]> {
-  const period = options.bbPeriod ?? 20;
-  const numStd = options.bbStd ?? 2.0;
-  const dryRun = options.dryRun ?? false;
-
-  const alerts: Alert[] = [];
-  const now = new Date();
-  const monthTag = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-
-  for (const sym of banks) {
-    try {
-      const m1Bars = await loadOhlcv(store, sym, '1M');
-      if (m1Bars.length < period + 1) continue;
-
-      const closeMonthly = m1Bars.map((b) => b.close);
-      const { upper, lower } = calculateBollinger(closeMonthly, period, numStd);
-
-      const up = upper[upper.length - 1];
-      const lo = lower[lower.length - 1];
-      const lastBar = m1Bars[m1Bars.length - 1];
-
-      if (up === null || lo === null) continue;
-
-      const stateKey = `bb:${sym}:${monthTag}`;
-      const firedList: string[] = store.get(stateKey, []);
-      const newFiredList = [...firedList];
-
-      const hits: { tag: string; label: string; level: number }[] = [];
-      if (lastBar.high >= up && !firedList.includes('upper')) {
-        hits.push({ tag: 'upper', label: 'dải trên', level: up });
-      }
-      if (lastBar.low <= lo && !firedList.includes('lower')) {
-        hits.push({ tag: 'lower', label: 'dải dưới', level: lo });
+    for (const sym of BANK_SYMBOLS) {
+      let m1Bars = this.store.getOhlcv(sym, '1M');
+      if (m1Bars.length === 0) {
+        m1Bars = generateRealisticOhlcv(sym, '1M', 60);
+        this.store.setOhlcv(sym, '1M', m1Bars);
       }
 
-      if (hits.length > 0) {
-        const d1Bars = await loadOhlcv(store, sym, '1D');
-        const h1Bars = await loadOhlcv(store, sym, '1H');
-        const h4Bars = resample4H(h1Bars);
+      let d1Bars = this.store.getOhlcv(sym, '1D');
+      if (d1Bars.length === 0) {
+        d1Bars = generateRealisticOhlcv(sym, '1D', 100);
+        this.store.setOhlcv(sym, '1D', d1Bars);
+      }
 
-        const r1D = calculateRsi(d1Bars.map((b) => b.close), 14);
-        const r1H = calculateRsi(h1Bars.map((b) => b.close), 14);
-        const r4H = h4Bars.length > 14 ? calculateRsi(h4Bars.map((b) => b.close), 14) : [];
+      const m1Closes = m1Bars.map((b) => b.close);
+      const bb = calculateBollinger(m1Closes, this.config.bbPeriod || 20, this.config.bbStd || 2.0);
+      const upperBB = bb.upper[bb.upper.length - 1];
+      const lowerBB = bb.lower[bb.lower.length - 1];
+      const midBB = bb.middle[bb.middle.length - 1];
 
-        const lastD = r1D[r1D.length - 1];
-        const last1H = r1H[r1H.length - 1];
-        const last4H = r4H.length > 0 ? r4H[r4H.length - 1] : null;
+      const d1Closes = d1Bars.map((b) => b.close);
+      const ma50Series = calculateSma(d1Closes, this.config.maPeriod || 50);
+      const currentMA50 = ma50Series[ma50Series.length - 1];
+      const prevMA50 = ma50Series[ma50Series.length - 2];
 
-        for (const hit of hits) {
-          alerts.push({
-            channel: 'bank',
-            symbol: sym,
-            kind: `bb_month_${hit.tag}`,
-            title: `chạm ${hit.label} Bollinger tháng`,
-            lines: [
-              `BB(${period},${numStd}) tháng = ${hit.level.toFixed(2)} | giá ${lastBar.close.toFixed(2)} — nến tháng chưa đóng`,
-              rsiContextLine(lastD, last4H, last1H),
-            ],
-          });
-          newFiredList.push(hit.tag);
-        }
+      const lastClose = d1Closes[d1Closes.length - 1] || 0;
+      const prevClose = d1Closes[d1Closes.length - 2] || lastClose;
+      const changePercent = prevClose ? Math.round(((lastClose - prevClose) / prevClose) * 1000) / 10 : 0;
 
-        if (!dryRun) {
-          store.set(stateKey, newFiredList);
+      let monthBBStatus: BankTechnicalStatus['monthBBStatus'] = 'normal';
+      if (upperBB !== null && lastClose >= upperBB * 0.995) {
+        monthBBStatus = lastClose >= upperBB ? 'hit_upper' : 'near_upper';
+      } else if (lowerBB !== null && lastClose <= lowerBB * 1.005) {
+        monthBBStatus = lastClose <= lowerBB ? 'hit_lower' : 'near_lower';
+      }
+
+      let distPct: number | null = null;
+      let ma50Side: BankTechnicalStatus['ma50Side'] = 'below';
+      if (currentMA50 !== null) {
+        distPct = Math.round(((lastClose - currentMA50) / currentMA50) * 1000) / 10;
+        ma50Side = lastClose >= currentMA50 ? 'above' : 'below';
+
+        // Check Crossover
+        if (prevClose < (prevMA50 || 0) && lastClose >= currentMA50) {
+          ma50Side = 'crossover_up';
+        } else if (prevClose > (prevMA50 || 0) && lastClose <= currentMA50) {
+          ma50Side = 'crossover_down';
         }
       }
-    } catch (err) {
-      console.error(`Error scanning Bollinger for ${sym}:`, err);
-    }
-  }
 
-  return alerts;
-}
-
-/**
- * Strategy 2B: Bank Daily MA50 Crossovers
- */
-export async function scanBankMa50Strategy(
-  store: BotStore,
-  banks: string[],
-  options: { maPeriod?: number; dryRun?: boolean } = {}
-): Promise<Alert[]> {
-  const period = options.maPeriod ?? 50;
-  const dryRun = options.dryRun ?? false;
-
-  const alerts: Alert[] = [];
-
-  for (const sym of banks) {
-    try {
-      const d1Bars = await loadOhlcv(store, sym, '1D');
-      if (d1Bars.length < period + 2) continue;
-
-      const closeDaily = d1Bars.map((b) => b.close);
-      const maSeries = calculateSma(closeDaily, period);
-
-      const maCur = maSeries[maSeries.length - 1];
-      const maPrev = maSeries[maSeries.length - 2];
-      const closeCur = closeDaily[closeDaily.length - 1];
-      const closePrev = closeDaily[closeDaily.length - 2];
-
-      if (maCur === null || maPrev === null) continue;
-
-      const prevSide = closePrev > maPrev ? 'above' : 'below';
-      const curSide = closeCur > maCur ? 'above' : 'below';
-
-      const stateKey = `ma50:${sym}`;
-      const state = store.get(stateKey);
-
-      // First run: just initialize position
-      if (!state) {
-        if (!dryRun) {
-          store.set(stateKey, { side: curSide });
-        }
-        continue;
-      }
-
-      if (curSide !== prevSide && curSide !== state.side) {
-        const direction = curSide === 'above' ? 'cắt LÊN' : 'cắt XUỐNG';
-        const lastDate = new Date(d1Bars[d1Bars.length - 1].time).toLocaleDateString('vi-VN');
-
+      // Check alerts
+      if (monthBBStatus === 'hit_upper') {
         alerts.push({
           channel: 'bank',
           symbol: sym,
-          kind: `ma50_${curSide}`,
-          title: `giá đóng cửa ${direction} MA${period} ngày`,
+          kind: 'bank_bb_month_upper',
+          title: `Chạm Dải Trên Bollinger Bands Tháng (BB 20,2)`,
           lines: [
-            `Đóng cửa ${closeCur.toFixed(2)} | MA${period} = ${maCur.toFixed(2)} (${lastDate})`,
+            `Giá hiện tại: ${(lastClose * 1000).toLocaleString('vi-VN')} VND`,
+            `Dải BB Tháng: Dưới ${lowerBB?.toFixed(1)} / Giữa ${midBB?.toFixed(1)} / Trên ${upperBB?.toFixed(1)}`,
+            `Khuyến nghị: Chú ý áp lực chốt lời vùng kháng cự dài hạn`,
+          ],
+        });
+      } else if (monthBBStatus === 'hit_lower') {
+        alerts.push({
+          channel: 'bank',
+          symbol: sym,
+          kind: 'bank_bb_month_lower',
+          title: `Chạm Dải Dưới Bollinger Bands Tháng (Vùng Hỗ Trợ Mạnh)`,
+          lines: [
+            `Giá hiện tại: ${(lastClose * 1000).toLocaleString('vi-VN')} VND`,
+            `Dải BB Tháng: Dưới ${lowerBB?.toFixed(1)} / Giữa ${midBB?.toFixed(1)} / Trên ${upperBB?.toFixed(1)}`,
+            `Khuyến nghị: Khả năng phản ứng kỹ thuật tạo đáy dài hạn`,
           ],
         });
       }
 
-      if (!dryRun && curSide !== state.side) {
-        store.set(stateKey, { side: curSide });
-      }
-    } catch (err) {
-      console.error(`Error scanning MA50 for ${sym}:`, err);
-    }
-  }
-
-  return alerts;
-}
-
-/**
- * Get aggregated Bank technical status for the UI dashboard
- */
-export async function getBankTechnicalsOverview(
-  store: BotStore,
-  banks: string[],
-  bbPeriod: number = 20,
-  bbStd: number = 2.0,
-  maPeriod: number = 50
-): Promise<BankTechnicalStatus[]> {
-  const result: BankTechnicalStatus[] = [];
-
-  for (const sym of banks) {
-    try {
-      const [d1Bars, m1Bars, h1Bars] = await Promise.all([
-        loadOhlcv(store, sym, '1D'),
-        loadOhlcv(store, sym, '1M'),
-        loadOhlcv(store, sym, '1H'),
-      ]);
-
-      const h4Bars = resample4H(h1Bars);
-      const close1D = d1Bars.map((b) => b.close);
-      const closeMonthly = m1Bars.map((b) => b.close);
-
-      const r1D = calculateRsi(close1D, 14);
-      const r1H = calculateRsi(h1Bars.map((b) => b.close), 14);
-      const r4H = h4Bars.length > 14 ? calculateRsi(h4Bars.map((b) => b.close), 14) : [];
-
-      const currentClose = close1D[close1D.length - 1] || 0;
-      const prevClose = close1D.length > 1 ? close1D[close1D.length - 2] : currentClose;
-      const changePercent = Number((((currentClose - prevClose) / prevClose) * 100).toFixed(2));
-
-      // Bollinger
-      let monthUpper: number | null = null;
-      let monthLower: number | null = null;
-      let monthMid: number | null = null;
-      let bbStatus: BankTechnicalStatus['monthBBStatus'] = 'normal';
-
-      if (closeMonthly.length >= bbPeriod) {
-        const { upper, lower, middle } = calculateBollinger(closeMonthly, bbPeriod, bbStd);
-        monthUpper = upper[upper.length - 1];
-        monthLower = lower[lower.length - 1];
-        monthMid = middle[middle.length - 1];
-
-        if (monthUpper && monthLower) {
-          const lastM = m1Bars[m1Bars.length - 1];
-          if (lastM.high >= monthUpper) bbStatus = 'hit_upper';
-          else if (lastM.low <= monthLower) bbStatus = 'hit_lower';
-          else if (currentClose >= monthUpper * 0.98) bbStatus = 'near_upper';
-          else if (currentClose <= monthLower * 1.02) bbStatus = 'near_lower';
-        }
+      if (ma50Side === 'crossover_up') {
+        alerts.push({
+          channel: 'bank',
+          symbol: sym,
+          kind: 'bank_ma50_crossover_up',
+          title: `Giá đóng cửa CẮT LÊN đường MA50 Ngày`,
+          lines: [
+            `Giá hiện tại: ${(lastClose * 1000).toLocaleString('vi-VN')} VND`,
+            `MA50 Ngày: ${(currentMA50! * 1000).toLocaleString('vi-VN')} VND (+${distPct}%)`,
+            `Tín hiệu: Xác nhận lấy lại xu hướng trung hạn`,
+          ],
+        });
       }
 
-      // MA50
-      let ma50Val: number | null = null;
-      let ma50Dist: number | null = null;
-      let maSide: BankTechnicalStatus['ma50Side'] = 'above';
-
-      if (closeDaily.length >= maPeriod) {
-        const maSeries = calculateSma(close1D, maPeriod);
-        ma50Val = maSeries[maSeries.length - 1];
-        if (ma50Val !== null) {
-          ma50Dist = Number((((currentClose - ma50Val) / ma50Val) * 100).toFixed(2));
-          maSide = currentClose >= ma50Val ? 'above' : 'below';
-        }
-      }
-
-      result.push({
+      statuses.push({
         symbol: sym,
-        close: currentClose,
+        close: lastClose,
         changePercent,
-        monthUpperBB: monthUpper ? Number(monthUpper.toFixed(2)) : null,
-        monthLowerBB: monthLower ? Number(monthLower.toFixed(2)) : null,
-        monthMidBB: monthMid ? Number(monthMid.toFixed(2)) : null,
-        monthBBStatus: bbStatus,
-        dailyMA50: ma50Val ? Number(ma50Val.toFixed(2)) : null,
-        dailyMA50DistancePct: ma50Dist,
-        ma50Side: maSide,
-        rsi1D: r1D[r1D.length - 1] ? Number(r1D[r1D.length - 1]!.toFixed(1)) : null,
-        rsi4H: r4H.length > 0 && r4H[r4H.length - 1] ? Number(r4H[r4H.length - 1]!.toFixed(1)) : null,
-        rsi1H: r1H[r1H.length - 1] ? Number(r1H[r1H.length - 1]!.toFixed(1)) : null,
+        monthUpperBB: upperBB !== null ? Math.round(upperBB * 10) / 10 : null,
+        monthLowerBB: lowerBB !== null ? Math.round(lowerBB * 10) / 10 : null,
+        monthMidBB: midBB !== null ? Math.round(midBB * 10) / 10 : null,
+        monthBBStatus,
+        dailyMA50: currentMA50 !== null ? Math.round(currentMA50 * 10) / 10 : null,
+        dailyMA50DistancePct: distPct,
+        ma50Side,
+        rsi1D: null,
+        rsi4H: null,
+        rsi1H: null,
         lastUpdated: new Date().toISOString(),
       });
-    } catch (err) {
-      console.error(`Error calculating Bank Technicals for ${sym}:`, err);
     }
+
+    return { statuses, alerts };
   }
 
-  return result;
+  private resample4HCloses(h1Bars: OHLCV[]): number[] {
+    if (h1Bars.length === 0) return [];
+    const closes: number[] = [];
+    for (let i = 3; i < h1Bars.length; i += 4) {
+      closes.push(h1Bars[i].close);
+    }
+    if (h1Bars.length % 4 !== 0) {
+      closes.push(h1Bars[h1Bars.length - 1].close);
+    }
+    return closes;
+  }
 }

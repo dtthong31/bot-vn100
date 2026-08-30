@@ -1,8 +1,6 @@
 import React from 'react';
 import {
   AlertTriangle,
-  ArrowUpRight,
-  CheckCircle2,
   Flame,
   Layers,
   Zap,

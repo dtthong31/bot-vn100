@@ -4,8 +4,6 @@ import {
   ArrowDownRight,
   ArrowUpRight,
   BarChart2,
-  CheckCircle2,
-  ShieldAlert,
 } from 'lucide-react';
 import { BankTechnicalStatus } from '../types';
 import { STOCK_NAMES } from '../bot/marketData';
@@ -55,7 +53,7 @@ export const BankTechnicalsTable: React.FC<BankTechnicalsTableProps> = ({
             {data.map((item) => {
               const isHitUpper = item.monthBBStatus === 'hit_upper';
               const isHitLower = item.monthBBStatus === 'hit_lower';
-              const isAboveMa50 = item.ma50Side === 'above';
+              const isAboveMa50 = item.ma50Side === 'above' || item.ma50Side === 'crossover_up';
 
               return (
                 <tr

@@ -1,29 +1,14 @@
 import express from 'express';
 import cors from 'cors';
-import path from 'path';
 import dotenv from 'dotenv';
+import path from 'path';
 import { createServer as createViteServer } from 'vite';
 
 import { globalStore } from './src/bot/store';
 import { NotifierService } from './src/bot/notifier';
-import {
-  BANK_SYMBOLS,
-  VN100_SYMBOLS,
-  isVietnamMarketOpen,
-  loadOhlcv,
-  resample4H,
-} from './src/bot/marketData';
-import {
-  scanRsiStrategy,
-  scanBankBollingerStrategy,
-  scanBankMa50Strategy,
-  getBankTechnicalsOverview,
-} from './src/bot/strategies';
-import {
-  calculateBollinger,
-  calculateRsi,
-  calculateSma,
-} from './src/bot/indicators';
+import { StrategyRunner } from './src/bot/strategies';
+import { BANK_SYMBOLS, VN100_SYMBOLS, generateRealisticOhlcv } from './src/bot/marketData';
+import { calculateBollinger, calculateRsi, calculateSma } from './src/bot/indicators';
 import { BotConfigState } from './src/types';
 
 dotenv.config();
@@ -34,351 +19,259 @@ const PORT = 3000;
 app.use(cors());
 app.use(express.json());
 
-// In-memory config state initialized from env
-const currentConfig = {
-  notifier: (process.env.NOTIFIER as 'console' | 'telegram' | 'slack') || 'console',
-  dryRun: process.env.DRY_RUN === '1',
+function checkIsMarketOpen(testWeekend: boolean = false): boolean {
+  if (testWeekend) return true;
+  const now = new Date();
+  // ICT is UTC+7
+  const ictHours = (now.getUTCHours() + 7) % 24;
+  const ictMinutes = now.getUTCMinutes();
+  const day = now.getUTCDay();
+
+  // Weekend check (0 is Sun, 6 is Sat)
+  if (day === 0 || day === 6) return false;
+
+  const currentMinutes = ictHours * 60 + ictMinutes;
+  const morningOpen = 9 * 60;
+  const morningClose = 11 * 60 + 30;
+  const afternoonOpen = 13 * 60;
+  const afternoonClose = 15 * 60;
+
+  return (
+    (currentMinutes >= morningOpen && currentMinutes <= morningClose) ||
+    (currentMinutes >= afternoonOpen && currentMinutes <= afternoonClose)
+  );
+}
+
+const initialTestWeekend = process.env.TEST_WEEKEND === '1' || process.env.TEST_WEEKEND === 'true';
+
+// In-memory runtime config initialized from env variables
+let botConfig: BotConfigState = {
+  notifier: (process.env.NOTIFIER as any) || 'slack',
+  dryRun: process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true',
   rsiPeriod: Number(process.env.RSI_PERIOD) || 14,
-  rsiOversold: Number(process.env.RSI_OVERSOLD) || 30.0,
+  rsiOversold: Number(process.env.RSI_OVERSOLD) || 30,
   bbPeriod: Number(process.env.BB_PERIOD) || 20,
   bbStd: Number(process.env.BB_STD) || 2.0,
   maPeriod: Number(process.env.MA_PERIOD) || 50,
   bounceExpiryDays: Number(process.env.BOUNCE_EXPIRY_DAYS) || 5,
-  maxRequestsPerMin: Number(process.env.MAX_RPM) || 18,
+  maxRequestsPerMin: Number(process.env.MAX_REQUESTS_PER_MIN) || 20,
   intradayScanMinutes: Number(process.env.INTRADAY_SCAN_MINUTES) || 30,
-  testWeekend: process.env.TEST_WEEKEND === '1',
-  telegramToken: process.env.TELEGRAM_BOT_TOKEN || '',
-  rsiChatId: process.env.RSI_CHAT_ID || '',
-  bankChatId: process.env.BANK_TECH_CHAT_ID || '',
-  slackRsiWebhook: process.env.SLACK_RSI_WEBHOOK || '',
-  slackBankWebhook: process.env.SLACK_BANK_WEBHOOK || '',
-  vnstockApiKey: process.env.VNSTOCK_API_KEY || '',
-  lastScanTime: null as string | null,
+  testWeekend: initialTestWeekend,
+  hasApiKey: Boolean(process.env.SSI_CONSUMER_ID || process.env.TCBS_TOKEN),
+  hasTelegramConfig: Boolean(process.env.TELEGRAM_BOT_TOKEN && (process.env.TELEGRAM_RSI_CHAT_ID || process.env.TELEGRAM_BANK_CHAT_ID)),
+  hasSlackConfig: Boolean(process.env.SLACK_RSI_WEBHOOK || process.env.SLACK_BANK_WEBHOOK),
+  isMarketOpen: checkIsMarketOpen(initialTestWeekend),
+  lastScanTime: null,
 };
+
+let slackRsiWebhook = process.env.SLACK_RSI_WEBHOOK || '';
+let slackBankWebhook = process.env.SLACK_BANK_WEBHOOK || '';
 
 const notifierService = new NotifierService(
   {
-    notifier: currentConfig.notifier,
-    telegramToken: currentConfig.telegramToken,
-    rsiChatId: currentConfig.rsiChatId,
-    bankChatId: currentConfig.bankChatId,
-    slackRsiWebhook: currentConfig.slackRsiWebhook,
-    slackBankWebhook: currentConfig.slackBankWebhook,
-    dryRun: currentConfig.dryRun,
+    notifier: botConfig.notifier,
+    telegramToken: process.env.TELEGRAM_BOT_TOKEN,
+    rsiChatId: process.env.TELEGRAM_RSI_CHAT_ID,
+    bankChatId: process.env.TELEGRAM_BANK_CHAT_ID,
+    slackRsiWebhook,
+    slackBankWebhook,
+    dryRun: botConfig.dryRun,
   },
   globalStore
 );
 
-// Cache for scanned table views
-let cachedRsiStatuses: any[] = [];
-let cachedBankStatuses: any[] = [];
+const strategyRunner = new StrategyRunner(globalStore, notifierService, botConfig);
 
-// Seed initial demo data / alerts on startup
-async function initialScan() {
-  try {
-    const { statuses } = await scanRsiStrategy(globalStore, VN100_SYMBOLS, {
-      period: currentConfig.rsiPeriod,
-      oversoldThreshold: currentConfig.rsiOversold,
-      bounceExpiryDays: currentConfig.bounceExpiryDays,
-      dryRun: false,
-    });
-    cachedRsiStatuses = statuses;
-
-    cachedBankStatuses = await getBankTechnicalsOverview(
-      globalStore,
-      BANK_SYMBOLS,
-      currentConfig.bbPeriod,
-      currentConfig.bbStd,
-      currentConfig.maPeriod
-    );
-
-    // Initial alert log examples
-    globalStore.logAlert(
-      'rsi',
-      'NVL',
-      'rsi4h_oversold',
-      'RSI 4H xuống dưới 30',
-      ['RSI ngày 34.2 | 4H 28.4 | 1H 26.1']
-    );
-    globalStore.logAlert(
-      'rsi',
-      'DIG',
-      'rsi1h_bounce',
-      'tín hiệu hồi ngắn hạn (RSI 1H cắt lên 30)',
-      ['RSI ngày 32.5 | 4H 29.8 | 1H 31.4']
-    );
-    globalStore.logAlert(
-      'bank',
-      'MBB',
-      'bb_month_upper',
-      'chạm dải trên Bollinger tháng',
-      ['BB(20,2) tháng = 26.80 | giá 26.85 — nến tháng chưa đóng', 'RSI ngày 62.4 | 4H 65.1 | 1H 64.0']
-    );
-    globalStore.logAlert(
-      'bank',
-      'TCB',
-      'ma50_above',
-      'giá đóng cửa cắt LÊN MA50 ngày',
-      ['Đóng cửa 24.50 | MA50 = 24.15 (Hôm nay)']
-    );
-
-    currentConfig.lastScanTime = new Date().toISOString();
-  } catch (err) {
-    console.error('Initial scan error:', err);
-  }
-}
-
-// ----------------------------------------------------------------------------
+// ==========================================
 // API ROUTES
-// ----------------------------------------------------------------------------
+// ==========================================
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
+// 1. Bot Config & Status
 app.get('/api/config', (req, res) => {
-  const configState: BotConfigState = {
-    notifier: currentConfig.notifier,
-    dryRun: currentConfig.dryRun,
-    rsiPeriod: currentConfig.rsiPeriod,
-    rsiOversold: currentConfig.rsiOversold,
-    bbPeriod: currentConfig.bbPeriod,
-    bbStd: currentConfig.bbStd,
-    maPeriod: currentConfig.maPeriod,
-    bounceExpiryDays: currentConfig.bounceExpiryDays,
-    maxRequestsPerMin: currentConfig.maxRequestsPerMin,
-    intradayScanMinutes: currentConfig.intradayScanMinutes,
-    testWeekend: currentConfig.testWeekend,
-    hasApiKey: !!currentConfig.vnstockApiKey,
-    hasTelegramConfig: !!(currentConfig.telegramToken && currentConfig.rsiChatId),
-    hasSlackConfig: !!currentConfig.slackRsiWebhook,
-    isMarketOpen: isVietnamMarketOpen(currentConfig.testWeekend),
-    lastScanTime: currentConfig.lastScanTime,
-  };
-  res.json(configState);
+  botConfig.isMarketOpen = checkIsMarketOpen(botConfig.testWeekend);
+  botConfig.hasSlackConfig = Boolean(slackRsiWebhook || slackBankWebhook);
+  botConfig.hasTelegramConfig = Boolean(process.env.TELEGRAM_BOT_TOKEN);
+  res.json(botConfig);
 });
 
 app.post('/api/config', (req, res) => {
-  const updates = req.body;
-  if (updates.notifier !== undefined) currentConfig.notifier = updates.notifier;
-  if (updates.dryRun !== undefined) currentConfig.dryRun = Boolean(updates.dryRun);
-  if (updates.rsiOversold !== undefined) currentConfig.rsiOversold = Number(updates.rsiOversold);
-  if (updates.bbPeriod !== undefined) currentConfig.bbPeriod = Number(updates.bbPeriod);
-  if (updates.bbStd !== undefined) currentConfig.bbStd = Number(updates.bbStd);
-  if (updates.maPeriod !== undefined) currentConfig.maPeriod = Number(updates.maPeriod);
-  if (updates.testWeekend !== undefined) currentConfig.testWeekend = Boolean(updates.testWeekend);
+  const updates = req.body || {};
+  if (updates.slackRsiWebhook !== undefined) slackRsiWebhook = updates.slackRsiWebhook;
+  if (updates.slackBankWebhook !== undefined) slackBankWebhook = updates.slackBankWebhook;
+
+  botConfig = {
+    ...botConfig,
+    ...updates,
+    hasSlackConfig: Boolean(slackRsiWebhook || slackBankWebhook),
+  };
 
   notifierService.updateConfig({
-    notifier: currentConfig.notifier,
-    dryRun: currentConfig.dryRun,
+    notifier: botConfig.notifier,
+    dryRun: botConfig.dryRun,
+    slackRsiWebhook,
+    slackBankWebhook,
   });
 
-  res.json({ success: true, config: currentConfig });
+  strategyRunner.updateConfig(botConfig);
+  res.json({ success: true, config: botConfig });
 });
 
+// 2. Stock Universe Data
+app.get('/api/universe/rsi', async (req, res) => {
+  try {
+    const { statuses } = await strategyRunner.scanRsi(VN100_SYMBOLS);
+    res.json(statuses);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to get RSI data' });
+  }
+});
+
+app.get('/api/universe/banks', async (req, res) => {
+  try {
+    const { statuses } = await strategyRunner.scanBanks();
+    res.json(statuses);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to get Bank data' });
+  }
+});
+
+// 3. Scan Triggers
+app.post('/api/scan/:type', async (req, res) => {
+  const { type } = req.params;
+  const start = Date.now();
+  botConfig.lastScanTime = new Date().toISOString();
+
+  let allAlerts: any[] = [];
+  let symbolsScanned = 0;
+
+  try {
+    if (type === 'rsi' || type === 'all') {
+      const rsiResult = await strategyRunner.scanRsi(VN100_SYMBOLS);
+      allAlerts = allAlerts.concat(rsiResult.alerts);
+      symbolsScanned += VN100_SYMBOLS.length;
+    }
+
+    if (type === 'bank' || type === 'all') {
+      const bankResult = await strategyRunner.scanBanks();
+      allAlerts = allAlerts.concat(bankResult.alerts);
+      symbolsScanned += BANK_SYMBOLS.length;
+    }
+
+    // Dispatch alerts
+    const logged = await notifierService.dispatchAlerts(allAlerts);
+
+    res.json({
+      timestamp: botConfig.lastScanTime,
+      scanType: type,
+      alertsGenerated: logged,
+      symbolsScanned,
+      durationMs: Date.now() - start,
+    });
+  } catch (err: any) {
+    console.error('Scan error:', err);
+    res.status(500).json({ error: err?.message || 'Scan execution failed' });
+  }
+});
+
+// 4. Alert History
 app.get('/api/alerts', (req, res) => {
   const channel = req.query.channel as 'rsi' | 'bank' | undefined;
-  const limit = req.query.limit ? Number(req.query.limit) : 100;
-  const logs = globalStore.getAlertLogs(channel, limit);
+  const logs = globalStore.getAlertLogs(channel);
   res.json(logs);
 });
 
 app.delete('/api/alerts', (req, res) => {
   globalStore.clearLogs();
-  res.json({ success: true, message: 'Đã xóa toàn bộ nhật ký cảnh báo.' });
+  res.json({ success: true });
 });
 
-app.get('/api/universe/rsi', async (req, res) => {
-  if (cachedRsiStatuses.length === 0) {
-    const { statuses } = await scanRsiStrategy(globalStore, VN100_SYMBOLS, {
-      period: currentConfig.rsiPeriod,
-      oversoldThreshold: currentConfig.rsiOversold,
-      bounceExpiryDays: currentConfig.bounceExpiryDays,
-      dryRun: true,
-    });
-    cachedRsiStatuses = statuses;
+// 5. Chart series data
+app.get('/api/chart/:symbol', (req, res) => {
+  const { symbol } = req.params;
+  const interval = (req.query.interval as '1D' | '1H' | '1M') || '1D';
+
+  let bars = globalStore.getOhlcv(symbol, interval);
+  if (bars.length === 0) {
+    // Generate if not cached
+    bars = generateRealisticOhlcv(symbol, interval, interval === '1M' ? 36 : 60);
+    globalStore.setOhlcv(symbol, interval, bars);
   }
-  res.json(cachedRsiStatuses);
+
+  const closes = bars.map((b: any) => b.close);
+  const rsi = calculateRsi(closes, 14);
+  const bb = calculateBollinger(closes, 20, 2.0);
+  const ma50 = calculateSma(closes, 50);
+
+  const series = bars.map((b: any, i: number) => ({
+    time: b.time,
+    open: b.open,
+    high: b.high,
+    low: b.low,
+    close: b.close,
+    volume: b.volume,
+    rsi: rsi[i],
+    bbUpper: bb.upper[i],
+    bbMiddle: bb.middle[i],
+    bbLower: bb.lower[i],
+    ma50: ma50[i],
+  }));
+
+  res.json({ symbol, interval, data: series });
 });
 
-app.get('/api/universe/banks', async (req, res) => {
-  if (cachedBankStatuses.length === 0) {
-    cachedBankStatuses = await getBankTechnicalsOverview(
-      globalStore,
-      BANK_SYMBOLS,
-      currentConfig.bbPeriod,
-      currentConfig.bbStd,
-      currentConfig.maPeriod
-    );
+// 6. Test Notifications
+app.post('/api/test/slack', async (req, res) => {
+  try {
+    const testAlert = {
+      channel: 'rsi' as const,
+      symbol: 'SSI',
+      kind: 'test_signal',
+      title: 'Tín hiệu Thử Nghiệm Kết Nối Slack (Test Alert)',
+      lines: [
+        'Kênh: SLACK_RSI_WEBHOOK & SLACK_BANK_WEBHOOK',
+        'Giá khớp mẫu: 36,500 VND (+2.8%)',
+        'Trạng thái: Kết nối Slack Webhook hoạt động hoàn hảo!',
+        `Thời gian gửi: ${new Date().toLocaleTimeString('vi-VN')} ICT`,
+      ],
+    };
+
+    const result = await notifierService.sendSlackBatch('rsi', [testAlert]);
+    if (result.success) {
+      globalStore.logAlert('rsi', testAlert.symbol, testAlert.kind, testAlert.title, testAlert.lines);
+      res.json({ success: true, message: 'Đã gửi test message tới Slack Webhook thành công' });
+    } else {
+      res.status(400).json({ success: false, error: result.error });
+    }
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || 'Lỗi gửi Slack test' });
   }
-  res.json(cachedBankStatuses);
-});
-
-app.post('/api/scan/rsi', async (req, res) => {
-  const startTime = Date.now();
-  const { alerts, statuses } = await scanRsiStrategy(globalStore, VN100_SYMBOLS, {
-    period: currentConfig.rsiPeriod,
-    oversoldThreshold: currentConfig.rsiOversold,
-    bounceExpiryDays: currentConfig.bounceExpiryDays,
-    dryRun: currentConfig.dryRun,
-  });
-
-  cachedRsiStatuses = statuses;
-  const loggedAlerts = await notifierService.dispatchAlerts(alerts);
-  currentConfig.lastScanTime = new Date().toISOString();
-
-  res.json({
-    timestamp: currentConfig.lastScanTime,
-    scanType: 'rsi',
-    alertsGenerated: loggedAlerts,
-    symbolsScanned: VN100_SYMBOLS.length,
-    durationMs: Date.now() - startTime,
-  });
-});
-
-app.post('/api/scan/bank', async (req, res) => {
-  const startTime = Date.now();
-  const bbAlerts = await scanBankBollingerStrategy(globalStore, BANK_SYMBOLS, {
-    bbPeriod: currentConfig.bbPeriod,
-    bbStd: currentConfig.bbStd,
-    dryRun: currentConfig.dryRun,
-  });
-
-  const maAlerts = await scanBankMa50Strategy(globalStore, BANK_SYMBOLS, {
-    maPeriod: currentConfig.maPeriod,
-    dryRun: currentConfig.dryRun,
-  });
-
-  const allAlerts = [...bbAlerts, ...maAlerts];
-  const loggedAlerts = await notifierService.dispatchAlerts(allAlerts);
-
-  cachedBankStatuses = await getBankTechnicalsOverview(
-    globalStore,
-    BANK_SYMBOLS,
-    currentConfig.bbPeriod,
-    currentConfig.bbStd,
-    currentConfig.maPeriod
-  );
-
-  currentConfig.lastScanTime = new Date().toISOString();
-
-  res.json({
-    timestamp: currentConfig.lastScanTime,
-    scanType: 'bank',
-    alertsGenerated: loggedAlerts,
-    symbolsScanned: BANK_SYMBOLS.length,
-    durationMs: Date.now() - startTime,
-  });
-});
-
-app.post('/api/scan/all', async (req, res) => {
-  const startTime = Date.now();
-
-  const { alerts: rsiAlerts, statuses } = await scanRsiStrategy(globalStore, VN100_SYMBOLS, {
-    period: currentConfig.rsiPeriod,
-    oversoldThreshold: currentConfig.rsiOversold,
-    bounceExpiryDays: currentConfig.bounceExpiryDays,
-    dryRun: currentConfig.dryRun,
-  });
-  cachedRsiStatuses = statuses;
-
-  const bbAlerts = await scanBankBollingerStrategy(globalStore, BANK_SYMBOLS, {
-    bbPeriod: currentConfig.bbPeriod,
-    bbStd: currentConfig.bbStd,
-    dryRun: currentConfig.dryRun,
-  });
-
-  const maAlerts = await scanBankMa50Strategy(globalStore, BANK_SYMBOLS, {
-    maPeriod: currentConfig.maPeriod,
-    dryRun: currentConfig.dryRun,
-  });
-
-  const allAlerts = [...rsiAlerts, ...bbAlerts, ...maAlerts];
-  const loggedAlerts = await notifierService.dispatchAlerts(allAlerts);
-
-  cachedBankStatuses = await getBankTechnicalsOverview(
-    globalStore,
-    BANK_SYMBOLS,
-    currentConfig.bbPeriod,
-    currentConfig.bbStd,
-    currentConfig.maPeriod
-  );
-
-  currentConfig.lastScanTime = new Date().toISOString();
-
-  res.json({
-    timestamp: currentConfig.lastScanTime,
-    scanType: 'all',
-    alertsGenerated: loggedAlerts,
-    symbolsScanned: VN100_SYMBOLS.length,
-    durationMs: Date.now() - startTime,
-  });
 });
 
 app.post('/api/test/telegram', async (req, res) => {
-  const now = new Date().toLocaleString('vi-VN');
-  const testAlerts = [
-    {
+  try {
+    const testAlert = {
       channel: 'rsi' as const,
-      symbol: 'TEST',
-      kind: 'test',
-      title: 'kiểm tra kết nối Telegram (Kênh RSI)',
-      lines: ['Nếu bạn thấy tin này, cấu hình Telegram đã đúng.', `Thời gian: ${now}`],
-    },
-    {
-      channel: 'bank' as const,
-      symbol: 'TEST',
-      kind: 'test',
-      title: 'kiểm tra kết nối Telegram (Kênh Ngân hàng)',
-      lines: ['Nếu bạn thấy tin này, cấu hình Telegram đã đúng.', `Thời gian: ${now}`],
-    },
-  ];
+      symbol: 'TCB',
+      kind: 'test_signal',
+      title: 'Tín hiệu Thử Nghiệm Kết Nối Telegram',
+      lines: [
+        'Giá khớp mẫu: 24,800 VND (+1.5%)',
+        'Trạng thái: Kết nối Telegram Bot hoạt động bình thường',
+        `Thời gian: ${new Date().toLocaleTimeString('vi-VN')}`,
+      ],
+    };
 
-  const logged = await notifierService.dispatchAlerts(testAlerts);
-  res.json({ success: true, sent: logged });
+    await notifierService.dispatchAlerts([testAlert]);
+    res.json({ success: true, message: 'Đã gửi test message tới Telegram' });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message });
+  }
 });
 
-app.get('/api/chart/:symbol', async (req, res) => {
-  const symbol = (req.params.symbol || 'VCB').toUpperCase();
-  const interval = ((req.query.interval as string) || '1D') as '1H' | '1D' | '1M';
-
-  const bars = await loadOhlcv(globalStore, symbol, interval);
-  const closes = bars.map((b) => b.close);
-
-  const rsiValues = calculateRsi(closes, 14);
-  const ma50Values = calculateSma(closes, 50);
-  const { upper, lower, middle } = calculateBollinger(closes, 20, 2.0);
-
-  const chartData = bars.map((bar, i) => ({
-    time: bar.time.split('T')[0] || bar.time,
-    fullTime: bar.time,
-    open: bar.open,
-    high: bar.high,
-    low: bar.low,
-    close: bar.close,
-    volume: bar.volume,
-    rsi: rsiValues[i],
-    ma50: ma50Values[i],
-    bbUpper: upper[i],
-    bbLower: lower[i],
-    bbMiddle: middle[i],
-  }));
-
-  res.json({
-    symbol,
-    interval,
-    count: chartData.length,
-    data: chartData,
-  });
-});
-
-// ----------------------------------------------------------------------------
-// SERVER LAUNCH & VITE INTEGRATION
-// ----------------------------------------------------------------------------
-
+// ==========================================
+// VITE SPA MIDDLEWARE & PRODUCTION SERVING
+// ==========================================
 async function startServer() {
-  await initialScan();
-
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -394,7 +287,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 VN100 Alert Bot Server running at http://localhost:${PORT}`);
+    console.log(`[VN100 Bot Server] Listening on http://0.0.0.0:${PORT}`);
   });
 }
 

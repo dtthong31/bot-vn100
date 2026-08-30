@@ -1,6 +1,5 @@
 import React, { useEffect, useState } from 'react';
 import {
-  Area,
   ComposedChart,
   Line,
   ReferenceLine,
@@ -9,7 +8,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { Activity, Flame, Layers, ShieldAlert, X } from 'lucide-react';
+import { X } from 'lucide-react';
 import { STOCK_NAMES } from '../bot/marketData';
 
 interface ChartModalProps {
@@ -125,7 +124,6 @@ export const ChartModal: React.FC<ChartModalProps> = ({ symbol, onClose }) => {
                           fontSize: '11px',
                         }}
                       />
-                      {/* Bollinger Band Upper & Lower Area */}
                       <Line
                         type="monotone"
                         dataKey="bbUpper"

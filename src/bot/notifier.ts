@@ -35,26 +35,32 @@ export class NotifierService {
   public async dispatchAlerts(alerts: Alert[]): Promise<AlertLogItem[]> {
     const loggedAlerts: AlertLogItem[] = [];
 
-    // Group by channel
+    // Group by channel ('rsi' & 'bank')
     for (const channel of ['rsi', 'bank'] as const) {
       const group = alerts.filter((a) => a.channel === channel);
       if (group.length === 0) continue;
 
-      // Always log to store for dashboard visibility
+      // Always log to in-memory store for dashboard visibility
       for (const a of group) {
         const item = this.store.logAlert(a.channel, a.symbol, a.kind, a.title, a.lines);
         loggedAlerts.push(item);
       }
 
+      // If dry-run is on, we skip external webhook dispatch unless it's test mode
+      if (this.cfg.dryRun) {
+        console.log(`[DRY_RUN] Skipped sending ${group.length} alerts to ${this.cfg.notifier}`);
+        continue;
+      }
+
       // External notification dispatch
-      if (this.cfg.notifier === 'telegram') {
-        await this.sendTelegramBatch(channel, group);
-      } else if (this.cfg.notifier === 'slack') {
+      if (this.cfg.notifier === 'slack') {
         await this.sendSlackBatch(channel, group);
+      } else if (this.cfg.notifier === 'telegram') {
+        await this.sendTelegramBatch(channel, group);
       } else {
         // Console mode
         console.log(`\n============================================================`);
-        console.log(`[${channel.toUpperCase()}] ${group.length} tín hiệu`);
+        console.log(`[${channel.toUpperCase()}] ${group.length} tín hiệu cảnh báo`);
         console.log(`============================================================`);
         for (const a of group) {
           console.log(`${a.symbol} — ${a.title}`);
@@ -66,6 +72,65 @@ export class NotifierService {
     }
 
     return loggedAlerts;
+  }
+
+  public async sendSlackBatch(channel: 'rsi' | 'bank', alerts: Alert[]): Promise<{ success: boolean; error?: string }> {
+    const webhookUrl = channel === 'rsi' ? this.cfg.slackRsiWebhook : this.cfg.slackBankWebhook;
+    if (!webhookUrl || !webhookUrl.startsWith('http')) {
+      const warnMsg = `[Slack] Chưa cấu hình URL Webhook hợp lệ cho kênh ${channel.toUpperCase()} (SLACK_${channel.toUpperCase()}_WEBHOOK)`;
+      console.warn(warnMsg);
+      return { success: false, error: warnMsg };
+    }
+
+    const header =
+      channel === 'rsi'
+        ? '🚨 Cảnh báo RSI — VN100'
+        : '🏦 Cảnh báo kỹ thuật — Ngân hàng VN100';
+
+    const maxBlocks = 45;
+    for (let i = 0; i < alerts.length; i += maxBlocks) {
+      const slice = alerts.slice(i, i + maxBlocks);
+      const blocks: any[] = [
+        {
+          type: 'header',
+          text: { type: 'plain_text', text: header, emoji: true },
+        },
+        { type: 'divider' },
+      ];
+
+      for (const a of slice) {
+        blocks.push({
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*${a.symbol}* — ${a.title}\n${a.lines.map((l) => `> ${l}`).join('\n')}`,
+          },
+        });
+      }
+
+      try {
+        const response = await fetch(webhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text: `${header}: ${slice.length} tín hiệu`,
+            blocks,
+          }),
+        });
+
+        if (!response.ok) {
+          const errBody = await response.text();
+          const err = `Slack Webhook returned HTTP ${response.status}: ${errBody}`;
+          console.error(err);
+          return { success: false, error: err };
+        }
+      } catch (err: any) {
+        console.error('Failed to send Slack webhook:', err);
+        return { success: false, error: err?.message || 'Network error sending to Slack' };
+      }
+    }
+
+    return { success: true };
   }
 
   private async sendTelegramBatch(channel: 'rsi' | 'bank', alerts: Alert[]): Promise<void> {
@@ -133,54 +198,6 @@ export class NotifierService {
       }
     } catch (err) {
       console.error('Failed to send Telegram message:', err);
-    }
-  }
-
-  private async sendSlackBatch(channel: 'rsi' | 'bank', alerts: Alert[]): Promise<void> {
-    const webhookUrl = channel === 'rsi' ? this.cfg.slackRsiWebhook : this.cfg.slackBankWebhook;
-    if (!webhookUrl) {
-      console.warn(`[Slack] Missing Webhook URL for channel ${channel}`);
-      return;
-    }
-
-    const header =
-      channel === 'rsi'
-        ? 'Cảnh báo RSI — VN100'
-        : 'Cảnh báo kỹ thuật — Ngân hàng VN100';
-
-    const maxBlocks = 48;
-    for (let i = 0; i < alerts.length; i += maxBlocks) {
-      const slice = alerts.slice(i, i + maxBlocks);
-      const blocks: any[] = [
-        {
-          type: 'header',
-          text: { type: 'plain_text', text: header, emoji: false },
-        },
-        { type: 'divider' },
-      ];
-
-      for (const a of slice) {
-        blocks.push({
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: `*${a.symbol}* — ${a.title}\n${a.lines.join('\n')}`,
-          },
-        });
-      }
-
-      try {
-        await fetch(webhookUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            text: `${header}: ${slice.length} tín hiệu`,
-            blocks,
-          }),
-        });
-      } catch (err) {
-        console.error('Failed to send Slack webhook:', err);
-      }
     }
   }
 
