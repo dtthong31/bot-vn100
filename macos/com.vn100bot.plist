@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.vn100bot</string>
+
+  <!-- caffeinate -i giữ máy không ngủ CHỪNG NÀO bot còn chạy.
+       Đây là cách đúng: không ép máy thức 24/7 vô điều kiện, chỉ thức
+       khi tiến trình bot đang sống. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-i</string>
+    <string>__PROJECT__/.venv/bin/python</string>
+    <string>__PROJECT__/run.py</string>
+    <string>serve</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__PROJECT__</string>
+
+  <!-- Chạy ngay khi đăng nhập, và tự bật lại nếu tiến trình chết -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Chờ 10 giây trước khi khởi động lại, tránh vòng lặp crash liên tục -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__PROJECT__/data/bot.log</string>
+  <key>StandardErrorPath</key>
+  <string>__PROJECT__/data/bot.error.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TZ</key>
+    <string>Asia/Ho_Chi_Minh</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+</dict>
+</plist>
