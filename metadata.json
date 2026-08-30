@@ -1,0 +1,6 @@
+{
+  "name": "VN100 Technical Alert Bot",
+  "description": "Bot cảnh báo kỹ thuật VN100 (RSI 4H/1H đa khung thời gian & Bollinger Bands/MA50 nhóm ngân hàng) tích hợp Telegram, Slack và giao diện quản trị trực quan.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
